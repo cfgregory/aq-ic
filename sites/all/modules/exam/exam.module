@@ -1,0 +1,889 @@
+<?php
+
+/**
+ * @file exam.module
+ *
+ * Core functionality for the exam engine.
+ */
+// --------------------------------------------------------------------------
+// Core Drupal hook implementations
+
+/**
+ * Implementation of hook_menu
+ */
+function exam_menu() {
+  $items = array();
+
+  $items['exam/end'] = array(
+    'title' => 'Exam finished',
+    'page callback' => 'exam_endpage',
+    'access callback' => 'exam_is_time',
+    'type' => MENU_CALLBACK,
+  );
+  $items['exam/escape'] = array(
+    'title' => 'Exam escaped',
+    'page callback' => 'exam_escapepage',
+    'access arguments' => array('escape exams'),
+    'type' => MENU_CALLBACK,
+  );
+  $items['admin/config/system/exam'] = array(
+    'title' => 'Exam',
+    'description' => 'Settings for the exam system.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('exam_admin_form'),
+    'access arguments' => array('administer site configuration'),
+  );
+
+  return $items;
+}
+
+/**
+ * Implementation of hook_init()
+ */
+function exam_init() {
+  global $user;
+
+  $escaping = $_GET['q'] == 'exam/escape' && user_access('escape exams');
+  if (isset($user->data['exam']['ended']) && !$escaping) {
+    if (isset($user->data['exam']['og_eid']) && REQUEST_TIME > $user->data['exam'][$user->data['exam']['og_eid']]['start'] + variable_get('exam_registration_time', 3600)) {
+      exam_clear();
+      drupal_set_message(t('The exam is over. You now have full access to the site.'));
+      drupal_goto('<front>');
+    }
+    elseif ($_GET['q'] != 'exam/end') {
+      drupal_goto('exam/end');
+    }
+  }
+  elseif ($escaping) {
+    if (exam_is_time()) {
+      exam_clear();
+      drupal_set_message(t('You have escaped the exam. You now have full access to the site.'));
+      drupal_goto('<front>');
+    }
+  }
+  elseif (exam_is_time()) {
+    $exam = $user->data['exam'][$user->data['exam']['og_eid']];
+    $nids = $exam['nids'];
+    $current_step_nid = $nids[$exam['step']];
+    $next_step_nid = isset($nids[$exam['step'] + 1]) ? $nids[$exam['step'] + 1] : FALSE;
+
+    if (arg(0) != 'node' || !in_array(arg(1), $nids)
+      || !$exam['navigation'] && !in_array(arg(1), array($current_step_nid, $next_step_nid))) {
+      drupal_goto('node/' . $current_step_nid);
+    }
+    elseif (arg(1) == $next_step_nid && !$exam['navigation']) {
+      $last_node_type = db_query("SELECT type FROM {node} WHERE nid = :nid", array(':nid' => $current_step_nid))->fetchField();
+      if (!in_array($last_node_type, array('quiz', 'webform'))) {
+        exam_next_step();
+      }
+      else {
+        drupal_goto('node/' . $current_step_nid);
+      }
+    }
+  }
+}
+
+/**
+ * Implementation of hook_entity_insert
+ */
+function exam_entity_presave($entity, $type) {
+  $diff = og_entity_presave_group_audience_diff($entity, $type);
+
+  if (!empty($diff['delete']) && $type == 'user') {
+    $og_eid = exam_get_og_eid_from_gid($diff['delete'][0]['gid']);
+    unset($entity->data['exam'][$og_eid]);
+    if (isset($entity->data['exam'], $entity->data['exam']['og_eid']) && $entity->data['exam']['og_eid'] == $og_eid) {
+      unset($entity->data['exam']['og_eid'], $entity->data['exam']['ended']);
+    }
+  }
+  elseif (!empty($diff['insert']) && $type == 'user') {
+    $og_eid = exam_get_og_eid_from_gid($diff['insert'][count($diff['insert']) - 1]['gid']);
+    $ogs = entity_load('node', array($og_eid));
+    if (!empty($ogs)) {
+      $og_node = $ogs[$og_eid];
+      exam_attach_exam_to_user($entity, $og_node);
+    }
+  }
+}
+
+/**
+ * Admin form for exam
+ */
+function exam_admin_form($form, &$form_state) {
+  $form['exam_registration_time'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Registration time'),
+    '#description' => t("When the exam starts the user has this given amount of time(in seconds) to log in and by doing so registering for the exam."),
+    '#default_value' => variable_get('exam_registration_time', 3600),
+  );
+
+  $form['exam_close_time'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Close time'),
+    '#description' => t("The time in seconds the user has from the time the exam starts until he can't access the exam anymore and the rest of the site becomes available."),
+    '#default_value' => variable_get('exam_close_time', 36000),
+  );
+  
+  return system_settings_form($form);
+}
+
+/**
+ * Get entity id from gid
+ *
+ * @param int $gid
+ *  group id
+ * @return int
+ *  Entity id
+ */
+function exam_get_og_eid_from_gid($gid) {
+  return db_query("SELECT etid FROM {og} WHERE gid = :gid", array(':gid' => $gid))->fetchField();
+}
+
+/**
+ * Implements hook_node_load().
+ */
+function exam_node_load($nodes, $types) {
+  static $exam_nodes_field_exists;
+  if (is_null($exam_nodes_field_exists)) {
+    $exam_nodes_field_exists = db_table_exists('field_data_exam_nodes');
+  }
+  if (!$exam_nodes_field_exists) {
+    return;
+  }
+  $exam_nodes = db_query("SELECT exam_nodes_target_id AS id FROM {field_data_exam_nodes} WHERE exam_nodes_target_id IN(:nids)", array(':nids' => array_keys($nodes)));
+  foreach ($exam_nodes as $exam_node) {
+    $nodes[$exam_node->id]->exam_node = TRUE;
+  }
+}
+
+/**
+ * Implements hook_node_access_records().
+ */
+function exam_node_access_records($node) {
+  $grants = array();
+  if (isset($node->exam_node) && $node->exam_node) {
+    $grants[] = array(
+      'realm' => 'exam_view',
+      'gid' => 1,
+      'grant_view' => 1,
+      'grant_update' => 0,
+      'grant_delete' => 0,
+      'priority' => 0,
+    );
+  }
+  return $grants;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter
+ */
+function exam_form_quiz_report_form_alter(&$form, &$form_state) {
+  global $user;
+
+  if (exam_is_time() && isset($user->data['exam'][$user->data['exam']['og_eid']])) {
+    $exam = $user->data['exam'][$user->data['exam']['og_eid']];
+    if ($exam['step'] == count($exam['nids']) - 1) {
+      $form['exam_end'] = array(
+        '#markup' => l(t('End exam'), 'exam/end'),
+        '#type' => 'markup',
+      );
+    }
+  }
+}
+
+/**
+ * Implements hook_node_grants().
+ */
+function exam_node_grants($account, $op) {
+  if (exam_is_time() || user_access('access outside exam', $account)) {
+    return array('exam_view' => array(1));
+  }
+}
+
+/**
+ * Invoked when the user is finished with the current step in the exam.
+ * 
+ * This function will end the exam if there are no more steps left.
+ */
+function exam_next_step() {
+  global $user;
+
+  $exam = &$user->data['exam'][$user->data['exam']['og_eid']];
+  if ($exam['step'] == count($exam['nids']) - 1) {
+    if (REQUEST_TIME > $exam['start'] + variable_get('exam_registration_time')) {
+      exam_clear();
+    }
+    else {
+      $user->data['exam']['ended'] = TRUE;
+    }
+  }
+  else {
+    $exam['step']++;
+  }
+  user_save($user);
+}
+
+/**
+ * Escapes exam mode
+ */
+function exam_clear() {
+  global $user;
+  if (isset($user->data['exam'])) {
+    if (isset($user->data['exam']['og_eid'])) {
+      unset($user->data['exam'][$user->data['exam']['og_eid']], $user->data['exam']['og_eid']);
+    }
+    if (isset($user->data['exam']['ended'])) {
+      unset($user->data['exam']['ended']);
+    }
+    user_save($user);
+  }
+  drupal_static_reset('exam_is_time', '', TRUE);
+}
+
+/**
+ * Implementation of hook_form_alter
+ */
+function exam_form_alter(&$form, $form_state, $form_id) {
+  if (isset($form['exam_start'])) {
+    $form['exam_start_old'] = array(
+      '#type' => 'value',
+      '#value' => $form['exam_start'][$form['exam_start']['#language']][0]['#default_value']['value'],
+    );
+    $form['exam_navigation_old'] = array(
+      '#type' => 'value',
+      '#value' => $form['exam_navigation'][$form['exam_navigation']['#language']]['#default_value'],
+    );
+    $form['exam_nodes_old'] = array(
+      '#type' => 'value',
+      '#value' => $form['exam_nodes'][$form['exam_nodes']['#language']]['#default_value'],
+    );
+  }
+}
+
+/**
+ * Implementation of hook_node_insert
+ */
+function exam_node_insert($node) {
+  exam_node_save($node);
+}
+
+/**
+ * Implementation of hook_node_update
+ */
+function exam_node_update($node) {
+  exam_node_save($node);
+}
+
+/**
+ * Act on node save (update or insert that is)
+ *
+ * @param object $node
+ *  Node object to be updated or inserted
+ */
+function exam_node_save($node) {
+  if (isset($node->exam_start, $node->group_group) && exam_fields_has_changed($node)) {
+    $users = db_query(
+      "SELECT ogm.etid
+      FROM {og_membership} ogm
+      JOIN {og} og ON ogm.gid = og.gid
+      LEFT OUTER JOIN {og_users_roles} ogu ON ogu.uid = ogm.etid AND ogu.gid = ogm.gid
+      WHERE og.entity_type = 'node'
+      AND ogm.entity_type = 'user'
+      AND (ogu.rid <> 3 OR ogu.rid is null)
+      AND og.etid = :etid", array(':etid' => $node->nid)
+      )->fetchAll();
+    $author = new stdClass();
+    $author->etid = $node->uid;
+    $users[] = $author;
+    foreach ($users as $user) {
+      $account = user_load($user->etid);
+      exam_attach_exam_to_user($account, $node);
+      user_save($account);
+    }
+  }
+}
+
+/**
+ * Attach an exam to a user
+ *
+ * @param object $account
+ *  The account we attach an exam to
+ * @param object $node
+ *  Group node holding all information about the exam
+ */
+function exam_attach_exam_to_user($account, $node) {
+  $exam_start = field_get_items('node', $node, 'exam_start');
+  $exam_navigation = field_get_items('node', $node, 'exam_navigation');
+  if (isset($account->data['exam']['og_eid']) && $account->data['exam']['og_eid'] == $node->nid) {
+    exam_clear();
+  }
+  $account->data['exam'][$node->nid] = array(
+    'start' => strtotime($exam_start[0]['value']),
+    'nids' => exam_get_nids_from_field($node, 'exam_nodes'),
+    'step' => 0,
+    'navigation' => $exam_navigation && $exam_navigation[0]['value'],
+    'nid' => $node->nid,
+  );
+}
+
+/**
+ * Figure out if the exam fields has changed
+ *
+ * @param object $node
+ *  The node to be checked
+ * @return Boolean
+ *  TRUE if one or more of the fields has changed
+ */
+function exam_fields_has_changed($node) {
+  $exam_start = field_get_items('node', $node, 'exam_start');
+  if (!isset($node->exam_start_old) || $exam_start[0]['value'] != $node->exam_start_old) {
+    return TRUE;
+  }
+  $exam_navigation = field_get_items('node', $node, 'exam_navigation');
+  if ($exam_navigation[0]['value'] XOR $node->exam_navigation_old) {
+    return TRUE;
+  }
+  $exam_nodes = field_get_items('node', $node, 'exam_nodes');
+  foreach ($exam_nodes as $target) {
+    if (strpos($node->exam_nodes_old, '(' . $target['target_id'] . ')') === FALSE) {
+      return TRUE;
+    }
+  }
+  $matches = array();
+  preg_match_all('/\(\d+\)/', $node->exam_nodes_old, $matches);
+  if (count($matches[0]) > count($exam_nodes)) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Implementation of hook_quiz_finished
+ */
+function exam_quiz_finished($quiz, $score, $session_data) {
+  if (exam_is_time()) {
+    exam_next_step();
+  }
+}
+
+/**
+ * Get a list of nids from a node a enitityreference field has attached nodes to
+ *
+ * @param object $node
+ *  The node the field has attached data to
+ * @param string $field_name
+ *  The name of the field
+ * @return array
+ *  Array for nids
+ */
+function exam_get_nids_from_field($node, $field_name) {
+  $field_values = field_get_items('node', $node, $field_name);
+  $nids = array();
+  foreach ($field_values as $field_value) {
+    $nids[] = $field_value['target_id'];
+  }
+  return $nids;
+}
+
+/**
+ * Implementation of hook_permission().
+ */
+function exam_permission() {
+  return array(
+    'take exams' => array(
+      'title' => t("Take exams"),
+      'description' => t("Allows a user to take exams."),
+    ),
+    'escape exams' => array(
+      'title' => t("Escape exams"),
+      'description' => t("Allows a user to escape exams"),
+    ),
+    'access outside exam' => array(
+      'title' => t("Access exam nodes outside exam"),
+      'description' => t("Allows a user to access exam nodes even if ho isn't in exam mode"),
+    ),
+  );
+}
+
+/**
+ * Implementation of hook_form_FORM_ID_alter
+ */
+function exam_form_node_type_form_alter(&$form, &$form_state) {
+  $form['exam'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Exam settings'),
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+    '#group' => 'additional_settings',
+  );
+  $is_enabled = (bool) field_info_instance('node', 'exam_start', $form['#node_type']->type);
+  $form['exam']['exam_enabled'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable exam'),
+    '#default_value' => $is_enabled,
+    '#description' => t('Enable exams for this content type'),
+  );
+}
+
+/**
+ * Implementation of hook_node_view
+ */
+function exam_node_view($node, $view_mode, $langcode) {
+  global $user;
+  if (exam_is_time() && !in_array($node->type, array('quiz', 'webform'))) {
+    $exam = $user->data['exam'][$user->data['exam']['og_eid']];
+    if (isset($exam['nids'][$exam['step'] + 1])) {
+      $node->content['exam_next'] = array(
+        '#markup' => '<div class="exam-next">' . l(t('Next step'), 'node/' . $exam['nids'][$exam['step'] + 1], array('attributes' => array('class' => 'button'))) . '</div>',
+        '#weight' => 70,
+      );
+    }
+  }
+}
+
+/**
+ * Implementation of hook_form_FORM_ID_alter
+ */
+function exam_form_block_admin_configure_alter(&$form, &$form_state) {
+  $exam_visibility = db_query(
+    "SELECT eb.exam_visibility
+    FROM {exam_block} eb
+    WHERE eb.module = :module
+    AND eb.delta = :delta", array(
+    ':module' => $form['module']['#value'],
+    ':delta' => $form['delta']['#value'],
+    ))
+    ->fetchField();
+  $form['visibility']['exam'] = array(
+    '#title' => t('Exam'),
+    '#type' => 'fieldset',
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+    '#group' => 'visibility',
+    '#weight' => 50,
+  );
+  $form['visibility']['exam']['exam_visibility'] = array(
+    '#title' => t('Show on exam pages'),
+    '#description' => t('By default all blocks are hidden on exam pages, but some blocks may be enabled for the exam pages.'),
+    '#type' => 'radios',
+    '#default_value' => $exam_visibility ? $exam_visibility : 0,
+    '#options' => array(
+      t('Hide when exam'),
+      t('Show when exam'),
+      t('Only show when exam'),
+    ),
+  );
+  $form['#submit'][] = 'exam_block_admin_configure_submit';
+}
+
+/**
+ * Submit handler for the block configuration form
+ */
+function exam_block_admin_configure_submit($form, &$form_state) {
+  db_merge('exam_block')
+    ->key(array(
+      'module' => $form_state['values']['module'],
+      'delta' => $form_state['values']['delta'],
+    ))
+    ->fields(array(
+      'exam_visibility' => $form_state['values']['exam_visibility'],
+    ))->execute();
+}
+
+/**
+ * Implementation of hook_block_info
+ */
+function exam_block_info() {
+  $blocks = array();
+
+  $blocks['steps'] = array(
+    'info' => t('Steps'),
+    'cache' => DRUPAL_NO_CACHE,
+  );
+  return $blocks;
+}
+
+/**
+ * Implementation of hook_form_BASE_FORM_ID_alter
+ */
+function exam_form_webform_client_form_alter(&$form, &$form_state, $form_id) {
+  if (exam_is_time()) {
+    $form['#submit'][] = 'exam_webform_submit';
+  }
+}
+
+/**
+ * Submit handler for webforms invoked during exam
+ */
+function exam_webform_submit($form, &$form_state) {
+  exam_next_step();
+}
+
+/**
+ * Implementation of hook_block_view
+ */
+function exam_block_view($delta = '') {
+  global $user;
+  $block = array();
+
+  switch ($delta) {
+    case 'steps':
+      $exam = $user->data['exam'][$user->data['exam']['og_eid']];
+      $block['subject'] = t('Steps');
+      $block['content'] = array(
+        '#theme' => 'exam_steps',
+        '#steps' => exam_block_get_steps(),
+        '#navigation' => $exam['navigation'],
+        '#step' => $exam['step'],
+        '#escape' => user_access('escape exams'),
+      );
+      break;
+  }
+  return $block;
+}
+
+/**
+ * Implementation of hook_theme
+ */
+function exam_theme($existing, $type, $theme, $path) {
+  return array(
+    'exam_steps' => array(
+      'render element' => 'content',
+      'path' => $path . '/theme',
+      'template' => 'exam-steps',
+    ),
+  );
+}
+
+/**
+ * Get step data for the current users active exam
+ * 
+ * @return array $steps
+ *  a sorted array of steps. Steps are objects with node type,
+ *  title and nid properties
+ */
+function exam_block_get_steps() {
+  global $user;
+
+  $exam = $user->data['exam'][$user->data['exam']['og_eid']];
+  $result = db_query(
+    "SELECT n.type, n.title, n.nid
+    FROM {node} n
+    WHERE n.nid IN (:nids)", array(':nids' => $exam['nids'])
+  );
+  $steps = array();
+  foreach ($result as $entry) {
+    $entry->title = check_plain($entry->title);
+    $steps[array_search($entry->nid, $exam['nids'])] = $entry;
+  }
+  ksort($steps);
+  return $steps;
+}
+
+/**
+ * Implementation of hook_block_list_alter
+ */
+function exam_block_list_alter(&$blocks) {
+  global $user;
+  // TODO: Replace db_table_exists
+  if (!empty($blocks) && db_table_exists('exam_block')) {
+    $is_exam_mode = exam_is_time();
+    $results = db_query(
+      "SELECT b.bid
+      FROM {block} b
+      JOIN {exam_block} eb ON b.theme = :theme AND b.module = eb.module AND b.delta = eb.delta
+      WHERE b.bid IN (:blocks)
+      AND exam_visibility IN (:exam_visibility)", array(
+      ':theme' => $GLOBALS['theme_key'],
+      ':blocks' => array_keys($blocks),
+      ':exam_visibility' => $is_exam_mode ? array(1, 2) : array(2),
+      )
+    );
+    $bids = array();
+    foreach ($results as $bid) {
+      $bids[] = $bid->bid;
+    }
+    foreach ($blocks as $bid => $block) {
+      if (in_array($bid, $bids) XOR $is_exam_mode) {
+        unset($blocks[$bid]);
+      }
+    }
+  }
+}
+
+/**
+ * Implement hook_node_type_delete().
+ *
+ * We immediately delete those variables as they are only used to indicate a
+ * content type should have exams. However, the actual
+ * indication for it is in the field API. This is just a workaround, specifically
+ * for the node entity, to allow users to define exams via the "content type"
+ * page.
+ */
+function exam_node_type_delete($info) {
+  variable_del('enable_exam_' . $info->type);
+}
+
+/**
+ * Implement hook_node_type_insert().
+ */
+function exam_node_type_insert($info) {
+  exam_node_type_save($info->type);
+}
+
+/**
+ * Implement hook_node_type_update().
+ */
+function exam_node_type_update($info) {
+  exam_node_type_save($info->type);
+}
+
+/**
+ * Add exam fields to new content types.
+ *
+ * @param $bundle_name
+ *   The content type name.
+ */
+function exam_node_type_save($bundle_name) {
+  if (variable_get('exam_enabled_' . $bundle_name, 0)) {
+    exam_create_fields($bundle_name);
+    // Delete the variable, as we will rely on the presence of th field.
+    variable_del('exam_enabled_' . $bundle_name);
+  }
+  else {
+    exam_delete_fields($bundle_name);
+  }
+}
+
+/**
+ * Add exam fields to a bundle
+ *
+ * @param string $bundle_name
+ *  Name of the bundle we will add fields to
+ */
+function exam_create_fields($bundle_name) {
+  $field = field_info_field('exam_start');
+  if (empty($field)) {
+    field_create_field(array(
+      'field_name' => 'exam_start',
+      'type' => 'datetime',
+      'locked' => TRUE,
+      'settings' => array(
+        'tz_handling' => 'none',
+      ),
+    ));
+  }
+  $instance = field_info_instance('node', 'exam_start', $bundle_name);
+  if (empty($instance)) {
+    $instance = array(
+      'field_name' => 'exam_start',
+      'entity_type' => 'node',
+      'bundle' => $bundle_name,
+      'label' => 'Exam start',
+      'description' => t('When is the exam supposed to start?'),
+      'required' => TRUE,
+      'settings' => array(
+        'default_value' => 'strtotime',
+        'default_value_code' => '+30 days',
+      ),
+    );
+    if (module_exists('date_popup')) {
+      $instance += array(
+        'widget' => array(
+          'type' => 'date_popup',
+          'settings' => array(
+            'input_format' => 'd/m/Y - H:i:s'
+          ),
+        ),
+      );
+    }
+    field_create_instance($instance);
+  }
+  $field = field_info_field('exam_nodes');
+  if (empty($field)) {
+    field_create_field(array(
+      'field_name' => 'exam_nodes',
+      'type' => 'entityreference',
+      'cardinality' => -1,
+      'locked' => FALSE,
+      'settings' => array(
+        'handler_settings' => array(
+          'sort' => array(
+            'type' => 'property',
+            'property' => 'title',
+            'field' => 'body:value',
+            'direction' => 'ASC',
+          ),
+        ),
+      ),
+    ));
+  }
+  $instance = field_info_instance('node', 'exam_nodes', $bundle_name);
+  if (empty($instance)) {
+    field_create_instance(array(
+      'field_name' => 'exam_nodes',
+      'entity_type' => 'node',
+      'bundle' => $bundle_name,
+      'label' => 'Exam nodes',
+      'description' => t('The nodes that are beeing used in the exam. The order of the nodes matters.'),
+      'required' => TRUE,
+      'widget' => array(
+        'type' => 'entityreference_autocomplete_tags',
+      ),
+      'display' => array(
+        'default' => array(
+          'label' => 'hidden',
+          'type' => 'hidden',
+        ),
+        'teaser' => array(
+          'label' => 'hidden',
+          'type' => 'hidden',
+        ),
+      ),
+    ));
+  }
+  $field = field_info_field('exam_navigation');
+  if (empty($field)) {
+    field_create_field(array(
+      'field_name' => 'exam_navigation',
+      'type' => 'list_boolean',
+      'locked' => FALSE,
+    ));
+  }
+  $instance = field_info_instance('node', 'exam_navigation', $bundle_name);
+  if (empty($instance)) {
+    field_create_instance(array(
+      'field_name' => 'exam_navigation',
+      'entity_type' => 'node',
+      'bundle' => $bundle_name,
+      'label' => 'Exam navigation',
+      'description' => t('Whether or not the user is allowed to navigate between the exam pages.'),
+      'required' => FALSE,
+      'widget' => array(
+        'type' => 'options_onoff',
+        'settings' => array(
+          'display_label' => TRUE,
+        ),
+      ),
+      'display' => array(
+        'default' => array(
+          'label' => 'hidden',
+          'type' => 'hidden',
+        ),
+        'teaser' => array(
+          'label' => 'hidden',
+          'type' => 'hidden',
+        ),
+      ),
+    ));
+  }
+}
+
+/**
+ * Delete exam fields from a bundle
+ *
+ * @param string $bundle_name
+ *  Name of the bundle we will delete fields from 
+ */
+function exam_delete_fields($bundle_name) {
+  $instance = field_info_instance('node', 'exam_start', $bundle_name);
+  field_delete_instance($instance);
+  $instance = field_info_instance('node', 'exam_nodes', $bundle_name);
+  field_delete_instance($instance);
+  $instance = field_info_instance('node', 'exam_navigation', $bundle_name);
+  field_delete_instance($instance);
+}
+
+// TODO: This needs a lot of optimization. The exam data should always be stored in the user objects
+// TODO: Perhaps this function should take in $account as an argument, as it is used in exam_node_grants().
+/**
+ * Find out if it is exam time for the current user
+ *
+ * @param boolean $override
+ *  Sets whether or not it is time for exam
+ * @return boolean
+ *  TRUE if we have an active exam for the current user
+ *  FALSE otherwise
+ */
+function exam_is_time($override = NULL) {
+  global $user;
+
+  $is_time = &drupal_static(__FUNCTION__);
+  
+  if ($override !== NULL) {
+    $is_time = $override;
+  }
+
+  if ($is_time !== NULL) {
+    return $is_time;
+  }
+  $is_time = FALSE;
+  if (isset($user->data['exam'])) {
+    if (isset($user->data['exam']['og_eid'])) {
+      if (isset($user->data['exam'][$user->data['exam']['og_eid']]) 
+      && $user->data['exam'][$user->data['exam']['og_eid']]['start'] + variable_get('exam_close_time', 36000) > REQUEST_TIME
+      && $user->data['exam'][$user->data['exam']['og_eid']]['start'] < REQUEST_TIME) {
+        $is_time = TRUE;        
+      }
+      else {
+        unset($user->data['exam']['og_eid'], $user->data['exam']['ended']);
+        user_save($user);
+        drupal_set_message(t('Your exam timed out'));
+      }      
+    }
+    if (!$is_time) {
+      foreach ($user->data['exam'] as $og_eid => $exam) {
+        if (!is_numeric($og_eid)) {
+          continue;
+        }
+        if ($exam['start'] + variable_get('exam_registration_time', 3600) < REQUEST_TIME) {
+          unset($user->data['exam'][$og_eid]);
+          if (isset($user->data['exam']['og_eid']) && $og_eid == $user->data['exam']['og_eid']) {
+            unset($user->data['exam']['og_eid'], $user->data['exam']['ended']);
+          }
+          user_save($user);
+        }
+        elseif ($exam['start'] < REQUEST_TIME && !empty($exam['nids'])) {
+          $is_time = TRUE;
+          $user->data['exam']['og_eid'] = $og_eid;
+          user_save($user);
+        }
+      }
+    }
+  }
+  return $is_time;
+}
+
+/**
+ * Page callback for the exam endpage
+ *
+ * @return string
+ *  Html output for the endpage 
+ */
+function exam_endpage() {
+  global $user;
+  return t('You have finished your exam. Time left until you get access to the rest of the site: %time.', array(
+      '%time' => gmdate('H:i:s', $user->data['exam'][$user->data['exam']['og_eid']]['start'] + variable_get('exam_registration_time') - REQUEST_TIME),
+    ));
+}
+
+/**
+ * Page callback for the exam escapepage
+ *
+ * @return string
+ *  Html output for the endpage
+ */
+function exam_escapepage() {
+  return t('You have escaped your exam.');
+}
+
+/**
+ * Find the group that has an exam
+ *
+ * @return int
+ *  Node id of the group that is having an exam
+ */
+function exam_get_og_eid() {
+  global $user;
+  return exam_is_time() ? $user->data['exam']['og_eid'] : FALSE;
+}

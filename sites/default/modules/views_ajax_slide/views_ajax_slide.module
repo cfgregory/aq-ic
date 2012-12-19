@@ -1,0 +1,41 @@
+<?php
+function views_ajax_slide_init(){
+	drupal_add_js(url(drupal_get_path("module", "views_ajax_slide")."/js/script_ajax_slide.js"));
+}
+
+function views_ajax_slide_ajax_render_alter(&$commands, $view) {
+$url_comp = explode('/', request_path());
+
+
+  if ( $url_comp[2]  === "sabbath_course" || $url_comp[0]  === "sabbath_course" ||  $url_comp[1]  === "sabbath_course" ) {
+ 
+	  foreach ($commands as &$command) {
+	    if ($command['command'] == 'viewsScrollTop') {	  	
+	      $command['command'] = '';
+			  
+	    }
+	    if ($command['command'] == 'insert') {
+	     $command['command'] = 'ajaxFlipLeft';		  
+		  $command['method']  = '';	
+	    }
+	  }
+  }
+}
+
+/*
+function views_ajax_slide_(&$commands, $view) {
+  if (arg(0) == "press" || arg(1) == "204") {
+	  foreach ($commands as &$command) {
+	    if ($command['command'] == 'viewsScrollTop') {	  	
+	      $command['command'] = '';
+			  
+	    }
+	    if ($command['command'] == 'insert') {
+	      $command['command'] = 'ajaxFlipLeft';
+		  $command['method']  = '';	
+	    }
+	  }
+  }
+}*/
+?>  
+

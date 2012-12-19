@@ -1,0 +1,15 @@
+name = Course test module
+core = 7.x
+dependencies[] = acl
+dependencies[] = content_access
+dependencies[] = entity
+dependencies[] = entity_token
+dependencies[] = rules
+files[] = course_test.classes.inc
+
+; Information added by drupal.org packaging script on 2012-11-13
+version = "7.x-1.0-alpha2"
+core = "7.x"
+project = "course"
+datestamp = "1352840757"
+

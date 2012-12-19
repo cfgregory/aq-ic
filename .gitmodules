@@ -1,0 +1,3 @@
+[submodule "sites/default/modules/webform_quiz"]
+	path = sites/default/modules/webform_quiz
+	url = http://git.drupal.org/sandbox/ollu/1597104.git

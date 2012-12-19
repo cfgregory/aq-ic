@@ -1,0 +1,63 @@
+<?php
+
+/**
+ * @file
+ * Install, update, and uninstall functions for the Organic groups module.
+ */
+
+/**
+ * Implements hook_uninstall().
+ */
+function exam_uninstall() {
+  // Remove all fields owned by exam.
+  foreach (field_read_fields(array('module' => 'exam'), array('include_inactive' => TRUE)) as $field){
+    // We need to invoke the storage_delete hook and the field_delete_instance
+    // here, even though this should be done by field_delete_field().
+    // The current version of this function only works on active fields,
+    // and during uninstall, the fields will be inactive.
+    // Can be removed once
+    // http://drupal.org/node/943772
+    // is fixed.
+    module_invoke($field['storage']['module'], 'field_storage_delete_field', $field);
+    $instances = field_read_instances(array('field_id' => $field['id']), array('include_inactive' => TRUE));
+    foreach ($instances as $instance) {
+      field_delete_instance($instance, FALSE);
+    }
+    field_delete_field($field['field_name']);
+  }
+}
+
+
+/**
+ * Implements hook_schema().
+ */
+function exam_schema() {
+  $schema = array();
+  $schema['exam_block'] = array(
+    'description' => 'Store extra information related to the blocks',
+    'fields' => array(
+      'module' => array(
+        'type' => 'varchar',
+        'length' => 64,
+        'not null' => TRUE,
+        'default' => '',
+        'description' => "The module from which the block originates; for example, 'user' for the Who's Online block, and 'block' for any custom blocks.",
+      ),
+      'delta' => array(
+        'type' => 'varchar',
+        'length' => 32,
+        'not null' => TRUE,
+        'default' => '0',
+        'description' => 'Unique ID for block within a module.',
+      ),
+      'exam_visibility' => array(
+        'description' => 'Controls the blocks visibility related to the exam context',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+    ),
+    'primary key' => array('module', 'delta'),
+  );
+  return $schema;
+}

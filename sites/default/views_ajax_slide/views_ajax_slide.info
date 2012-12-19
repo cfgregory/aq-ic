@@ -1,0 +1,5 @@
+name = Views AJAX Slide
+description = Implement a smooth sliding between views ajax pages.
+package = Views
+core = 7.x
+

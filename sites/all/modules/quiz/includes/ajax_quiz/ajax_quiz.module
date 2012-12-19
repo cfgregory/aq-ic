@@ -1,0 +1,104 @@
+<?php
+
+
+/*
+ * @file
+ * module file for ajax_quiz quiz module
+ */
+
+/**
+ * Implementation of hook_help().
+ */
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function ajax_quiz_help($path, $arg) {
+  if ($path == 'admin/help#ajax_quiz') {
+    return '<p>' . t('AJAX version of quiz. Successive quiz questions will be loaded in the same page without page reload.') . '</p>';
+  }
+}
+
+/**
+ * Implementation of hook_perm()
+ * Valid permissions for this module
+ * @return array An array of valid permissions.
+ */
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function ajax_quiz_permission() {
+  return array(
+    'access ajax quiz' => array(
+      'title' => t('access ajax quiz'),
+      'description' => t('TODO Add a description for \'access ajax quiz\''),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ *
+ */
+function ajax_quiz_menu() {
+  $items = array();
+  $items['node/%quiz_type_access/ajax-quiz'] = array(
+    'title' => 'Take by AJAX',
+    'file' => 'ajax_quiz.admin.inc',
+    'page callback' => 'ajax_quiz_instruction',
+    'page arguments' => array(1),
+    'access arguments' => array('access ajax quiz'),
+    'type' => MENU_LOCAL_TASK,
+  );
+  return $items;
+}
+
+/*
+ * @function
+ * Implementation of hook_init
+ * includes the necessary js file(s).
+ */
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function ajax_quiz_init() {
+  //drupal_add_js(drupal_get_path('module', 'ajax_quiz') . '/ajax_quiz.js');
+  module_load_include('inc', 'ajax_quiz', 'ajax_quiz.admin');
+  }
+
+function ajax_quiz_block($op = 'list', $delta = 0, $edit = array()) {
+  $function_name = "ajax_quiz_block_$op";
+  if(function_exists($function_name)) {
+    return $function_name($delta, $edit);
+  }
+}
+
+function ajax_quiz_block_list($delta, $edit) {
+  $blocks = array();
+
+  $quiz_nodes_result = db_query("SELECT node.nid AS nid, node.title as title FROM {node} node WHERE node.type = 'quiz' ORDER BY node.nid");
+  while(($row = db_fetch_object($quiz_nodes_result))) {
+    $blocks["embedded_quiz_{$row->nid}"] = array(
+      'info' => t("AJAX Quiz:").' '.$row->title,
+      'cache' => BLOCK_NO_CACHE,
+    );
+  }
+
+  return $blocks;
+}
+
+function ajax_quiz_block_view($delta, $edit) {
+  $block = array();
+  $prefix = 'embedded_quiz_';
+  if(substr($delta, 0, strlen($prefix)) == $prefix) {
+    $block_nid = substr($delta, strlen($prefix));
+    $block['subject'] = 'Quiz';
+    $block['content'] = ajax_quiz_instruction(node_load($block_nid));
+  }
+  return $block;
+}
+

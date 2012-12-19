@@ -1,0 +1,19 @@
+<?php
+function views_ajax_slide_init(){
+	drupal_add_js(url(drupal_get_path("module", "views_ajax_slide")."/js/script_ajax_slide.js"));
+}
+
+function views_ajax_slide_ajax_render_alter(&$commands, $view) {
+  foreach ($commands as &$command) {
+    if ($command['command'] == 'viewsScrollTop') {	  	
+      $command['command'] = '';
+    }
+    if ($command['command'] == 'insert') {	  	
+      $command['command'] = 'ajaxFlipLeft';
+	  $command['method']  = '';	
+    }
+  }
+}
+
+
+?>  
